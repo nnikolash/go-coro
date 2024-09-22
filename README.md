@@ -4,7 +4,7 @@
 
 This library implements coroutines to have control over how time is perceived by the program. It can run **simulations** of any periods of time in a **easy-to-read** and **easy-to-maintain** manner. The code then can be switched to use real time, so that same code used both for simulation and real application.
 
-This library uses [go-chrono](github.com/nnikolash/go-chrono) for time simulation.
+This library uses [go-chrono](https://github.com/nnikolash/go-chrono) for time simulation.
 
 ## **What is coroutine?**
 
@@ -36,7 +36,7 @@ Unfortunatelly, there no such option on Go, and I did not find alternative solut
 Central object of almost any coroutine framework is `EventLoop`. By **coroutine** we call a function, which is scheduled on event loop for processing.
 
 Event loop is constructed from a `chrono.Clock`. The clock defines time which will be used by event loop to schedule and process events.
-Library [go-chrono](github.com/nnikolash/go-chrono) provies two clocks: `RealClock` for real time execution, and `Simulator` for simulation.
+Library [go-chrono](https://github.com/nnikolash/go-chrono) provies two clocks: `RealClock` for real time execution, and `Simulator` for simulation.
 
 Each coroutine function has **context** argument - `coro.Context`. This context can be used to:
 
