@@ -2,7 +2,7 @@
 
 ## What this library can do?
 
-This library implements coroutines to provide control over how time is perceived by the program. It can run **simulations** of any periods of time in a **easy-to-read** and **easy-to-maintain** manner. Such code than can be switched to use real time, so that same code used both for simulation and real application.
+This library implements coroutines to have control over how time is perceived by the program. It can run **simulations** of any periods of time in a **easy-to-read** and **easy-to-maintain** manner. The code then can be switched to use real time, so that same code used both for simulation and real application.
 
 This library uses [go-chrono](github.com/nnikolash/go-chrono) for time simulation.
 
