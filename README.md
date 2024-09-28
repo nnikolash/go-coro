@@ -129,7 +129,7 @@ See folder `examples` and test files `*_test.go` for more examples.
 
 ## Troubleshooting
 
-#### Program hangs on ProcessAll
+### Program hangs on ProcessAll
 
 There could be multiple reasons:
 
@@ -137,7 +137,7 @@ There could be multiple reasons:
 * You coroutine blocks on waiting for some syncronisation primitive: mutex, channel etc. But it will neven become available because entire event loop is waiting for this coroutine.
 * You have periodic job, which you did not stop. The job creates new task everytime previous is processed, so there is always tasks in a loop.
 
-#### ProcessAll exists unexpectedly
+### ProcessAll exists unexpectedly
 
 First time working with simulator might produce confusing issues. That is because usually when we work with real-time programs we are used to make some assumptions, which in simulated time might not be true.
 
@@ -162,7 +162,7 @@ Here an error is that `loop.AddTask()` called instead of `ctx.Go()`. In real tim
 In simulated world, time between events passes in instant. So infinity may pass faster than goroutine even starts.
 That's why **goroutines** and **channels** most of the time **should not be used** with the coroutines or should we used with caution.
 
-#### How to synchonine without using mutex/channels?
+### How to synchonine without using mutex/channels?
 
 Coroutines all run on the same thread, so most of the time synchronization is not even need. But if it is still needed, it is possible to implement any synchronization primitive by using funtions `Pause()` and `Resume()` of context.
 An example of implementation of such primitive is `coro.Mutext`.
