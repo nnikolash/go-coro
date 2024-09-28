@@ -162,7 +162,7 @@ Here an error is that `loop.AddTask()` called instead of `ctx.Go()`. In real tim
 In simulated world, time between events passes in instant. So infinity may pass faster than goroutine even starts.
 That's why **goroutines** and **channels** most of the time **should not be used** with the coroutines or should we used with caution.
 
-### How to synchonine without using mutex/channels?
+### How to synchonize without using mutex/channels?
 
 Coroutines all run on the same thread, so most of the time synchronization is not even need. But if it is still needed, it is possible to implement any synchronization primitive by using funtions `Pause()` and `Resume()` of context.
 An example of implementation of such primitive is `coro.Mutext`.
