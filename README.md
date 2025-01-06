@@ -28,12 +28,12 @@ Most of the actions of the strategy were triggered by market data ticks, so it w
 
 Although it worked fine, such **code was hard to read and maintain**. But then I started to write some additional logic - indicators. They also had periodic actions inside them. This increased ugliness of the code even more. Sometimes there were even multiple of such "timers" in one place, and accounting for them all became really complicated.
 
-I started to look for ways to control time in Go. My plan what to use all the regular stuff of Go, but in background to shift time returned from `time.Tim`e() and used by `time.AfterFunc()` .
-Unfortunatelly, there no such option on Go, and I did not find alternative solutions. So I decided to create my own library.
+I started to look for ways to control time in Go. My plan what to use all the regular stuff of Go, but in background to shift time returned from `time.Time()` and used by `time.AfterFunc()` .
+Unfortunatelly, at that time there no such option in Go, and I did not find alternative solutions. So I decided to create my own library.
 
 ## Usage
 
-Central object of almost any coroutine framework is `EventLoop`. By **coroutine** we call a function, which is scheduled on event loop for processing.
+Central object of almost any coroutine framework is `EventLoop`. By **coroutine** we mean a function, which is scheduled on event loop for processing.
 
 Event loop is constructed from a `chrono.Clock`. The clock defines time which will be used by event loop to schedule and process events.
 Library [go-chrono](https://github.com/nnikolash/go-chrono) provies two clocks: `RealClock` for real time execution, and `Simulator` for simulation.
@@ -122,6 +122,7 @@ clock.ProcessAll()
 
 Coroutine is executed until it releases control. It can be done by interrupting it using `ctx.Sleep()` or `ctx.SleepUntil()`.
 Creating task by `ctx.Go()` does not release control, so sometimes `ctx.Sleep()` in required in addition to `ctx.Go()` to not stall the program.
+After coroutine released control, it is paused until ready to be continued.
 
 ## Examples
 
@@ -134,8 +135,8 @@ See folder `examples` and test files `*_test.go` for more examples.
 There could be multiple reasons:
 
 * You have loop without `ctx.Sleep()`.
-* You coroutine blocks on waiting for some syncronisation primitive: mutex, channel etc. But it will neven become available because entire event loop is waiting for this coroutine.
-* You have periodic job, which you did not stop. The job creates new task everytime previous is processed, so there is always tasks in a loop.
+* Your coroutine blocks on waiting for some syncronisation primitive: mutex, channel etc. But it will neven become available because entire event loop is waiting for this coroutine to yield control.
+* You have periodic job, which you did not stop. The job creates a new task everytime previous is processed, so there is always tasks in a loop.
 
 ### ProcessAll exists unexpectedly
 
@@ -147,7 +148,7 @@ Most of the time these assumptions are related to the time of execution of some 
 loop.AddTask(fun(ctx coro.Context) {
    for i := 0; i < 100; i++ {
       go loop.AddTask(func(ctx coro.Context) {
-         processEvent(ctx, i)
+         ...
       })
 
       ctx.Sleep(time.Second)
@@ -157,12 +158,12 @@ loop.AddTask(fun(ctx coro.Context) {
 clock.ProcessAll()
 ```
 
-Here an error is that `loop.AddTask()` called instead of `ctx.Go()`. In real time sleep of 1 second would be more than enough for event processor to be scheduled onto loop. But in simulation this sleep is in instant moment. So most likely goroutines won't even start execution before 100 sleep will be processed. After that `ProcessAll()` will see that no stasks left, and will return. After task goroutines will start adding event processor, but it will be too late.
+Here an error is that `go ...` called instead of `ctx.Go()`. In real time sleep of 1 second would be more than enough for goroutine to start and do its job. But in simulation this sleep is an instant moment. So in this case most likely goroutines won't even start execution before 100 sleeps will be processed. After that `ProcessAll()` will see that no tasks left, and will return. After that goroutines will eventually start adding new tasks, but it will be too late - the has already stopped.
 
 In simulated world, time between events passes in instant. So infinity may pass faster than goroutine even starts.
-That's why **goroutines** and **channels** most of the time **should not be used** with the coroutines or should we used with caution.
+That's why **goroutines** and **channels** most of the time **should not be used** with the coroutines or should we used with caution. Avoid assuming, that some code will execute faster than other code without explicit synchronization.
 
 ### How to synchonize without using mutex/channels?
 
-Coroutines all run on the same thread, so most of the time synchronization is not even need. But if it is still needed, it is possible to implement any synchronization primitive by using funtions `Pause()` and `Resume()` of context.
-An example of implementation of such primitive is `coro.Mutext`.
+Coroutines all run on the same thread, so most of the time synchronization is not even need. But if it is still needed, it is possible to implement any synchronization primitive by using funtions `Pause()` and `Resume()` of the context.
+An example of implementation of such primitive is `coro.Mutex`.
