@@ -10,12 +10,12 @@ This library uses [go-chrono](https://github.com/nnikolash/go-chrono) for time s
 
 **Coroutine** - is a piece of **synchornous** code, which can be interrupted and then continuted from last point. Coroutines were invented to overcome terrible readability of asynchronous callback-based code, which for a long time was a standard way of implementing asyncronous logic. Coroutines is just a **syntax-sugar over callbacks**.
 
-Good examples of transition from callacks to coroutines:
+Good examples of transition from callbacks to coroutines:
 
 * C++: Boost.Asio.IoService -> Boost.Asio.Coroutines (stackless & stackfull) or async/await (stackless)
 * JavaScript: setTimeout -> Promise() -> async/await (stackless)
 
-The concent of coroutines is so much easier for perception than callbacks, that even on a system level they still make sense.  That's why Temporal team has inveted their sort-a system-wide coroutines.
+The concept of coroutines is so much easier for perception than callbacks, that even on a system level they still make sense.  That's why Temporal team has inveted their sort-a system-wide coroutines.
 
 In **Golang** we have built-in **goroutines**, which are type of stackfull coroutines (or fibers). Their purpose is to increase performance of and add control over executing code.
 Unfortunatelly only Go scheduler has control of when goroutine is interrupted and resumed. So we can't directly use goroutines for time simulation.
