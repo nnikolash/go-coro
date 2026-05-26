@@ -9,6 +9,11 @@ import (
 type Context interface {
 	Clock
 	Go(f func(ctx Context))
+	// Spawn is the Scheduler-flavored equivalent of Go. It exists so that
+	// coro.Context satisfies coro.Scheduler without needing an adapter — pass
+	// `ctx` directly to any function expecting a Scheduler. Internally Spawn
+	// just delegates to Go.
+	Spawn(f func(s Scheduler))
 	Pause()
 	Resume()
 }
@@ -31,6 +36,10 @@ var _ Context = &contextT{}
 
 func (c *contextT) Go(f func(ctx Context)) {
 	c.After(0, f)
+}
+
+func (c *contextT) Spawn(f func(s Scheduler)) {
+	c.Go(func(child Context) { f(child) })
 }
 
 func (c *contextT) Pause() {

@@ -2,6 +2,7 @@ package coro_test
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -17,7 +18,22 @@ func TestEventLoop_RealClock(t *testing.T) {
 	clock := chrono.NewRealClock()
 	loop := coro.NewEventLoop(clock)
 
+	// Under RealClock each coroutine resumes from its own time.AfterFunc
+	// goroutine, so the append below must be mutex-protected even though
+	// concurrencyDetector asserts logical exclusion. Without the mutex
+	// `go test -race` flags an obvious data race on `res`.
+	var mu sync.Mutex
 	res := []int{}
+	appendRes := func(v int) {
+		mu.Lock()
+		res = append(res, v)
+		mu.Unlock()
+	}
+	snapshot := func() []int {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]int(nil), res...)
+	}
 
 	d := concurrencyDetector{}
 
@@ -25,7 +41,7 @@ func TestEventLoop_RealClock(t *testing.T) {
 		d.Check()
 
 		ctx.Sleep(100 * time.Millisecond)
-		res = append(res, 1)
+		appendRes(1)
 		ctx.Sleep(100 * time.Millisecond)
 	})
 
@@ -33,26 +49,26 @@ func TestEventLoop_RealClock(t *testing.T) {
 		d.Check()
 
 		ctx.Sleep(250 * time.Millisecond)
-		res = append(res, 2)
+		appendRes(2)
 	})
 
 	loop.AddTask(func(ctx coro.Context) {
 		d.Check()
 
 		ctx.Sleep(275 * time.Millisecond)
-		res = append(res, 3)
+		appendRes(3)
 	})
 
 	loop.AddTask(func(ctx coro.Context) {
 		d.Check()
 
 		ctx.Sleep(300 * time.Millisecond)
-		res = append(res, 4)
+		appendRes(4)
 	})
 
 	time.Sleep(350 * time.Millisecond)
 
-	require.Equal(t, []int{1, 2, 3, 4}, res)
+	require.Equal(t, []int{1, 2, 3, 4}, snapshot())
 }
 
 func TestEventLoop_Stable(t *testing.T) {

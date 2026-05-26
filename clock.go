@@ -70,6 +70,14 @@ func (t *clockT) SleepUntil(t0 time.Time) {
 	t.ctrl.Yield()
 }
 
+// Wait blocks the coroutine until condition() returns.
+//
+// IMPORTANT: condition() runs on a raw goroutine — it does NOT yield to the
+// event loop. Under chrono.Simulator that means the simulator may advance the
+// virtual clock past any events condition() was waiting for, and the program
+// will hang or return early. Wait is only safe with chrono.RealClock.
+// For Simulator-driven code, signal completion via coro.Callback* posted back
+// to the event loop instead.
 func (t *clockT) Wait(condition func()) {
 	go func() {
 		condition()

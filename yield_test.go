@@ -41,3 +41,36 @@ func TestYieldingThread_Basic(t *testing.T) {
 
 	require.Equal(t, []int{1, 2, 3, 4, 5, 6, 7}, res)
 }
+
+func TestYieldController_ContinueAfterFinished(t *testing.T) {
+	t.Parallel()
+
+	// Continue must safely report false once the coroutine has finished.
+	thread := coro.GoYielding(func(yield coro.Yield) {
+		// Runs to completion without yielding.
+	}, nil)
+
+	thread.WaitUntilYielded()
+
+	require.False(t, thread.Continue(), "Continue should return false after Done")
+}
+
+func TestYieldController_ContinueResumesPaused(t *testing.T) {
+	t.Parallel()
+
+	var stage int
+
+	thread := coro.GoYielding(func(yield coro.Yield) {
+		stage = 1
+		yield()
+		stage = 2
+	}, nil)
+
+	thread.WaitUntilYielded()
+	require.Equal(t, 1, stage)
+
+	require.True(t, thread.Continue(), "Continue should return true while paused")
+
+	thread.WaitUntilYielded()
+	require.Equal(t, 2, stage)
+}

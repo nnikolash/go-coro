@@ -124,9 +124,112 @@ Coroutine is executed until it releases control. It can be done by interrupting 
 Creating task by `ctx.Go()` does not release control, so sometimes `ctx.Sleep()` in required in addition to `ctx.Go()` to not stall the program.
 After coroutine released control, it is paused until ready to be continued.
 
+## The `Scheduler` interface — decoupling library code from `coro.Context`
+
+If you are building a library or an `Indicator`-style object that wants
+`Now() / Sleep / Spawn` semantics **without** taking on `coro.Context` as a
+public dependency, use the narrow `coro.Scheduler` interface:
+
+```go
+type Scheduler interface {
+    Now() time.Time
+    Since(t time.Time) time.Duration
+    Until(t time.Time) time.Duration
+    Sleep(d time.Duration)
+    SleepUntil(t time.Time)
+    Spawn(f func(s Scheduler))
+}
+```
+
+`coro.Context` implements `Scheduler` directly — any function expecting a
+Scheduler can be called with a Context. No adapter, no wrapping:
+
+```go
+func (ind *MyIndicator) Publish(s coro.Scheduler, evt Event) {
+    s.Sleep(ind.window)
+    ind.listener.Notify(s, evt)
+}
+
+// inside a coroutine: pass ctx straight through.
+loop.AddTask(func(ctx coro.Context) {
+    ind.Publish(ctx, evt)
+})
+```
+
+Two non-Context implementations ship in this package:
+
+- `coro.NewLoopScheduler(loop)` — outside any coroutine, when you only need
+  `Now()` / `Spawn(...)`. `Sleep` panics here (no coroutine to yield from).
+- `coro.NewInlineScheduler(now)` — purely synchronous, no event loop, no
+  goroutines, no `sync.Cond`. Sleep advances an in-memory clock instantly;
+  Spawn runs `f` inline on the caller's goroutine. Use it to **unit-test
+  Scheduler-based code without spinning up `chrono.Simulator`** and without
+  `if ctx == nil` branches in production code.
+
+```go
+// unit test — no event loop, deterministic, race-free
+s := coro.NewInlineScheduler(time.Unix(0, 0))
+ind.Publish(s, evt)
+require.Equal(t, 1, listener.Calls)
+```
+
+Why `Spawn` and not `Go`? `Context.Go(f func(Context))` and
+`Scheduler.Spawn(f func(Scheduler))` differ in their callback type, so they
+must have different names — Go doesn't allow one type to expose both. `Spawn`
+delegates to `Go` internally; they share the exact same scheduling semantics.
+
 ## Examples
 
 See folder `examples` and test files `*_test.go` for more examples.
+
+## Do / Don't inside coroutines
+
+`coro.Context` schedules work on a virtual `chrono.Clock`. Under
+`chrono.Simulator` (used for backtesting and deterministic tests), the clock
+only advances when a coroutine **yields back to the event loop**. The standard
+Go concurrency primitives don't yield, so they will silently misbehave in
+simulation. The rule of thumb: **everything time-related must go through `ctx`
+or `chrono.Clock`**.
+
+### ❌ Don't
+
+Inside a `coro.Context`-driven coroutine, do **not** use:
+
+| Anti-pattern | Why it breaks in `Simulator` |
+|---|---|
+| `time.Sleep(d)` | Blocks on the real OS clock; the simulator can't observe or advance through it. |
+| `<-time.After(d)` | Same as above — pulls from the real clock. |
+| `go someFunc()` (with no coordination) | The simulator may exhaust all scheduled tasks before the goroutine wakes. Whatever the goroutine planned to do gets dropped. |
+| `<-ch` / `ch <- v` | Channels don't yield to the event loop; if no other coroutine drives the other side, the loop sees no pending work and returns. |
+| `sync.WaitGroup.Wait()` / `sync.Mutex.Lock()` | Blocks the goroutine without yielding. Same hazard as raw goroutines. |
+| `ctx.Wait(condition)` with a real-clock `condition` | `Wait` spawns a raw goroutine — only safe with `RealClock` (see `clock.go`). Do not use under `Simulator`. |
+
+### ✅ Do
+
+| Pattern | Effect |
+|---|---|
+| `ctx.Sleep(d)` / `ctx.SleepUntil(t)` | Yields to the event loop and resumes once virtual time has advanced by `d` (Simulator: instant; RealClock: real wait). |
+| `ctx.Go(func(ctx) { ... })` | Spawns a child coroutine on the same event loop. The child yields like any other coroutine. |
+| `ctx.After(d, func(ctx) { ... })` / `ctx.Every(d, ...)` | Schedules a deferred coroutine — the wrapper is what makes it Simulator-safe. |
+| `coro.Callback(loop, cb)` / `Callback1` / `Callback2` | Adapt a callback-style API into a Scheduler-friendly closure that posts a task to the loop instead of running inline. Use these on any boundary where external code (e.g. an HTTP client, a websocket reader) wants to call you back from a foreign goroutine. |
+| `coro.NewMutex()` | A coroutine-aware mutex — yields properly via `Pause/Resume`. Use this instead of `sync.Mutex` if multiple coroutines on the same loop need exclusion. |
+
+### When you really need to talk to a real goroutine
+
+The only correct bridge is to post back through the event loop. Wrap your
+goroutine's completion in `loop.AddTask(...)` (or use `coro.Callback*` to wrap
+a callback the foreign code will call), so the resulting work runs on the
+event-loop thread under a fresh `Context`.
+
+```go
+// HTTP-style example — the response handler must NOT call ctx methods
+// directly from the http client's goroutine.
+client.Get(url, coro.Callback1(loop, func(ctx coro.Context, resp Response) {
+    // Safe: this runs on the event loop thread under a fresh coroutine.
+    ctx.Sleep(time.Second)
+    process(ctx, resp)
+}))
+```
 
 ## Troubleshooting
 
