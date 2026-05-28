@@ -56,5 +56,11 @@ func TestExample1(t *testing.T) {
 
 	clock.ProcessAll(context.Background())
 
-	require.Equal(t, []int{0, 1, 0, 2, 1, 3, 2, 4, 3, 5, 4, 6, 5, 6}, res)
+	// go-chrono v1.1.0 made equal-deadline tasks resolve FIFO by insertion
+	// order (previously heap-layout-dependent). That shifts the interleaving of
+	// same-tick wakeups: the stop flag (len(res) >= 9) now trips one spawn
+	// earlier, so event 6 is never generated. Every generated event is still
+	// processed twice (before and after its sleep) — the result is just a
+	// deterministic, shorter schedule.
+	require.Equal(t, []int{0, 1, 0, 2, 1, 3, 2, 4, 3, 5, 4, 5}, res)
 }

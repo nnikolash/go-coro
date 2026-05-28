@@ -3,7 +3,7 @@ module github.com/nnikolash/go-coro
 go 1.22
 
 require (
-	github.com/nnikolash/go-chrono v1.0.0
+	github.com/nnikolash/go-chrono v1.1.0
 	github.com/stretchr/testify v1.9.0
 )
 
