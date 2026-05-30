@@ -127,8 +127,11 @@ the boundary), so it warrants its own change.
 
 1. **Keep the goroutine + `sync.Cond` design** — idiomatic, correct, matches Temporal/SimPy.
 2. **Add a teardown/cancel path** to stop leaking suspended-coroutine goroutines on simulation end —
-   the single concrete improvement. Tie an `EventLoop.Close()` (or `RunCoroutine` cancel) into the
-   backtester's run lifecycle.
+   the single concrete improvement. **DONE (2026-05-30):** `EventLoop.Close()` now cancels every
+   still-suspended coroutine via the panic-unwind technique described above (`YieldController.Cancel`
+   resumes the parked goroutine in cancel mode → `Yield` panics a sentinel → stack unwinds running
+   defers → recovered at the `RunCoroutine` boundary). Tie `defer loop.Close()` into the backtester's
+   run lifecycle.
 3. **Do not migrate** to `iter.Pull`/runtime coro (not reusable) or to carrot/dispatchrun (stale).
 
 ## Primary sources

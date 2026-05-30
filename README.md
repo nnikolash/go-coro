@@ -303,19 +303,31 @@ confirmed it against the Go ecosystem and established deterministic-simulation s
 Verdict: the current design is idiomatic and correct; there is no better library or primitive to
 migrate to.
 
-### ⚠️ Known limitation: suspended coroutines are blocked goroutines
+### Suspended coroutines are goroutines — call `loop.Close()` to reclaim them
 
-Because a suspended coroutine is a goroutine parked on `sync.Cond.Wait()`, it is only cleaned up when
+A suspended coroutine is a real goroutine parked on `sync.Cond.Wait()`; it is only cleaned up when
 its resume task actually fires. **If the simulation ends while coroutines are still suspended, those
-goroutines leak** (stay blocked forever). This happens when:
+goroutines leak** (stay blocked forever) unless you tear them down. This happens when:
 
 * `Simulator.ProcessAllUntil(ctx, until)` returns and some coroutine was sleeping past `until`;
 * the context is cancelled mid-run;
 * backtest data ends while a strategy coroutine is mid-`Sleep`;
 * a `coro.Mutex`/`Pause` never gets a matching `Resume`.
 
-There is currently **no `EventLoop.Close()` / cancel API** to tear these down. This is mostly
-harmless for a single run that drains to completion, but **matters for long-lived processes that run
-many backtests** (e.g. parameter-optimization sweeps): leaked goroutines and their captured state
-accumulate across runs. If you sweep, prefer a fresh process per batch, or drain each run to
-completion, until a teardown API exists.
+**`EventLoop.Close()` tears down every still-suspended coroutine** and returns how many it reclaimed.
+Call it once the simulation has stopped (i.e. when no coroutine is running):
+
+```go
+loop := coro.NewEventLoop(clock)
+defer loop.Close() // reclaim any coroutines left parked when the run ends
+
+// ... schedule tasks, ProcessAll / ProcessAllUntil ...
+```
+
+This is mostly harmless to skip for a one-shot run that drains to completion, but **matters for
+long-lived processes that run many backtests** (e.g. parameter-optimization sweeps): without
+`Close()`, leaked goroutines and their captured state accumulate across runs.
+
+Teardown is delivered as a panic that unwinds the coroutine's stack, so **each coroutine's deferred
+cleanup runs** — but do **not** blanket-`recover()` inside coroutine code, or you will swallow the
+teardown sentinel and the goroutine will leak anyway.
