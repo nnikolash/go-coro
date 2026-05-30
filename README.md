@@ -270,3 +270,52 @@ That's why **goroutines** and **channels** most of the time **should not be used
 
 Coroutines all run on the same thread, so most of the time synchronization is not even need. But if it is still needed, it is possible to implement any synchronization primitive by using funtions `Pause()` and `Resume()` of the context.
 An example of implementation of such primitive is `coro.Mutex`.
+
+## Design, prior art and alternatives
+
+A coroutine here is implemented as **one real goroutine per coroutine**, coordinated by a
+per-coroutine `sync.Cond` baton (`paused`/`finished` flags): exactly one coroutine runs at a time,
+yielding (`ctx.Sleep`/`Pause`) blocks its goroutine on the cond, and a clock-scheduled task resumes
+it. This is a deliberate, standard design. A 2026 multi-source review
+([`docs/2026-05-30-coroutine-design-research.md`](docs/2026-05-30-coroutine-design-research.md))
+confirmed it against the Go ecosystem and established deterministic-simulation systems:
+
+* The **goroutine-as-coroutine baton** is the established pre-Go-1.23 way to get stackful
+  coroutines/fibers. Go 1.23's runtime coroutines (behind `iter.Pull`) are the *same* idea, just
+  faster (~20ns vs ~190ns per switch) — but `coroswitch` is unexported and `iter.Pull` is a
+  forward-only iterator, **not** a reusable general coroutine primitive. `sync.Cond` has no spurious
+  wakeups, so the baton handshake is correct.
+* **Cooperative coroutines yielding to a virtual clock, with nondeterministic primitives forbidden**,
+  is the recognized pattern for deterministic simulation and replay: it matches **SimPy** (processes
+  are generators yielding to a simulation-time loop) and **Temporal** (workflow coroutines run one at
+  a time, no native goroutines/wall-clock, *same code in production and replay*).
+
+### Honest comparison
+
+| Option | Design | Reusable for this | Status (2026) |
+|---|---|---|---|
+| **go-coro** (this) | goroutine + `sync.Cond` baton over `chrono.Clock` | — | maintained |
+| Go 1.23 `iter.Pull` / runtime coro | faster goroutine-baton (`coroswitch`) | ❌ forward-only iterator; `coroswitch` unexported | stdlib |
+| [nvlled/carrot](https://github.com/nvlled/carrot) | one goroutine per coroutine, one-at-a-time (same as this) | ⚠️ same model, no benefit | ❌ unmaintained, low adoption |
+| [dispatchrun/coroutine](https://github.com/dispatchrun/coroutine) | compiler/codegen durable coroutines | ⚠️ different model | ❌ experimental, stale |
+| [Temporal](https://docs.temporal.io/) | hosted workflow engine | ⚠️ heavyweight; not a library | ✅ but a different scale of tool |
+
+Verdict: the current design is idiomatic and correct; there is no better library or primitive to
+migrate to.
+
+### ⚠️ Known limitation: suspended coroutines are blocked goroutines
+
+Because a suspended coroutine is a goroutine parked on `sync.Cond.Wait()`, it is only cleaned up when
+its resume task actually fires. **If the simulation ends while coroutines are still suspended, those
+goroutines leak** (stay blocked forever). This happens when:
+
+* `Simulator.ProcessAllUntil(ctx, until)` returns and some coroutine was sleeping past `until`;
+* the context is cancelled mid-run;
+* backtest data ends while a strategy coroutine is mid-`Sleep`;
+* a `coro.Mutex`/`Pause` never gets a matching `Resume`.
+
+There is currently **no `EventLoop.Close()` / cancel API** to tear these down. This is mostly
+harmless for a single run that drains to completion, but **matters for long-lived processes that run
+many backtests** (e.g. parameter-optimization sweeps): leaked goroutines and their captured state
+accumulate across runs. If you sweep, prefer a fresh process per batch, or drain each run to
+completion, until a teardown API exists.
