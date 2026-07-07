@@ -3,10 +3,21 @@ package coro
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	chrono "github.com/nnikolash/go-chrono"
 )
+
+// panicSleepOutsideCoroutine is the shared panic message for Sleep called
+// outside a coroutine. Reused by loopScheduler.Sleep and eventLoopT.Sleep /
+// SleepUntil so that all "no current coroutine" paths surface the same text.
+const panicSleepOutsideCoroutine = "coro.NewLoopScheduler: Sleep is only valid inside a coroutine; pass the coroutine's Context there"
+
+// panicSleepUntilOutsideCoroutine is the panic message for loopScheduler.SleepUntil.
+// Kept distinct from panicSleepOutsideCoroutine so that existing test assertions
+// on the exact message continue to pass.
+const panicSleepUntilOutsideCoroutine = "coro.NewLoopScheduler: SleepUntil is only valid inside a coroutine; pass the coroutine's Context there"
 
 type EventLoop interface {
 	Clock() chrono.Clock
@@ -40,12 +51,21 @@ func NewEventLoop(clock chrono.Clock) *eventLoopT {
 type eventLoopT struct {
 	clock chrono.Clock
 
+	// current is the *contextT of the coroutine that is actively running on
+	// this loop. It is nil when the pump is between coroutines. Under
+	// chrono.Simulator (cooperative, single-threaded) this pointer is
+	// well-defined at all times. Under chrono.RealClock concurrent resumes
+	// can race; the atomic ensures no data-race but the value is semantically
+	// undefined — do not rely on it there.
+	current atomic.Pointer[contextT]
+
 	liveMu sync.Mutex
 	live   map[*YieldController]struct{}
 }
 
 var _ EventLoop = &eventLoopT{}
 var _ coroutineRegistry = &eventLoopT{}
+var _ currentTracker = &eventLoopT{}
 
 func (e *eventLoopT) Clock() chrono.Clock {
 	return e.clock
@@ -61,6 +81,46 @@ func (e *eventLoopT) unregisterCoroutine(ctrl *YieldController) {
 	e.liveMu.Lock()
 	delete(e.live, ctrl)
 	e.liveMu.Unlock()
+}
+
+// setCurrentCoroutine stores ctx as the active coroutine and returns the
+// previous value. Part of the currentTracker interface; used at each enter-site
+// with save/restore semantics.
+func (e *eventLoopT) setCurrentCoroutine(ctx *contextT) *contextT {
+	return e.current.Swap(ctx)
+}
+
+// Sleep suspends the currently-running coroutine for duration d, delegating to
+// the coroutine's own Clock.Sleep. Panics if called outside a coroutine.
+// Under chrono.Simulator this is deterministic; under RealClock the behaviour
+// is undefined (see field current).
+func (e *eventLoopT) Sleep(d time.Duration) {
+	cur := e.current.Load()
+	if cur == nil {
+		panic(panicSleepOutsideCoroutine)
+	}
+	cur.Sleep(d)
+}
+
+// SleepUntil suspends the currently-running coroutine until the given wall time,
+// delegating to the coroutine's own Clock.SleepUntil. Panics outside a coroutine.
+func (e *eventLoopT) SleepUntil(t time.Time) {
+	cur := e.current.Load()
+	if cur == nil {
+		panic(panicSleepOutsideCoroutine)
+	}
+	cur.SleepUntil(t)
+}
+
+// CurrentScheduler returns the Scheduler of the currently-running coroutine, or
+// nil when the pump is between coroutines. Under chrono.RealClock the value is
+// racy and should not be used.
+func (e *eventLoopT) CurrentScheduler() Scheduler {
+	cur := e.current.Load()
+	if cur == nil {
+		return nil
+	}
+	return cur
 }
 
 // Close tears down every coroutine that is still suspended on this loop and

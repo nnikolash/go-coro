@@ -55,12 +55,8 @@ type loopScheduler struct {
 func (s *loopScheduler) Now() time.Time                  { return s.loop.Clock().Now() }
 func (s *loopScheduler) Since(t time.Time) time.Duration { return s.loop.Clock().Since(t) }
 func (s *loopScheduler) Until(t time.Time) time.Duration { return s.loop.Clock().Until(t) }
-func (s *loopScheduler) Sleep(time.Duration) {
-	panic("coro.NewLoopScheduler: Sleep is only valid inside a coroutine; pass the coroutine's Context there")
-}
-func (s *loopScheduler) SleepUntil(time.Time) {
-	panic("coro.NewLoopScheduler: SleepUntil is only valid inside a coroutine; pass the coroutine's Context there")
-}
+func (s *loopScheduler) Sleep(time.Duration)             { panic(panicSleepOutsideCoroutine) }
+func (s *loopScheduler) SleepUntil(time.Time)            { panic(panicSleepUntilOutsideCoroutine) }
 func (s *loopScheduler) Spawn(f func(Scheduler)) {
 	s.loop.AddTask(func(c Context) { f(c) })
 }
@@ -113,4 +109,3 @@ func (s *inlineScheduler) SleepUntil(t time.Time) {
 func (s *inlineScheduler) Spawn(f func(Scheduler)) {
 	f(&inlineScheduler{clock: s.clock})
 }
-

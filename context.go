@@ -19,17 +19,26 @@ type Context interface {
 }
 
 func newContext(eventLoop EventLoop, ctrl *YieldController) *contextT {
-	return &contextT{
-		Clock: newClock(eventLoop, ctrl),
+	clk := newClock(eventLoop, ctrl)
+	ctx := &contextT{
+		Clock: clk,
 		ctrl:  ctrl,
 		clock: eventLoop.Clock(),
 	}
+	// Establish the back-pointer so clockT resume closures can call
+	// ctx.runUntilYielded() (enter-sites 2–4).
+	clk.ctx = ctx
+	if t, ok := eventLoop.(currentTracker); ok {
+		ctx.tracker = t
+	}
+	return ctx
 }
 
 type contextT struct {
 	Clock
-	ctrl  *YieldController
-	clock chrono.Clock
+	ctrl    *YieldController
+	clock   chrono.Clock
+	tracker currentTracker // nil when evtLoop doesn't implement currentTracker
 }
 
 var _ Context = &contextT{}
@@ -46,9 +55,24 @@ func (c *contextT) Pause() {
 	c.ctrl.Yield()
 }
 
-func (c *contextT) Resume() {
-	c.clock.AfterFunc(0, func(now time.Time) {
+// runUntilYielded resumes this coroutine and, if a currentTracker is available,
+// wraps the call with save/restore of the active-coroutine pointer. This is the
+// shared implementation for all enter-sites (clock resume closures + Resume).
+func (c *contextT) runUntilYielded() {
+	if c.tracker != nil {
+		prev := c.tracker.setCurrentCoroutine(c)
 		c.ctrl.RunUntilYielded()
+		c.tracker.setCurrentCoroutine(prev)
+	} else {
+		c.ctrl.RunUntilYielded()
+	}
+}
+
+func (c *contextT) Resume() {
+	// Enter-site 5/5: explicit Resume. Scheduled as an AfterFunc(0) so it
+	// runs on the pump goroutine rather than the caller's goroutine.
+	c.clock.AfterFunc(0, func(now time.Time) {
+		c.runUntilYielded()
 	})
 }
 

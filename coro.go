@@ -9,6 +9,18 @@ type coroutineRegistry interface {
 	unregisterCoroutine(ctrl *YieldController)
 }
 
+// currentTracker is implemented by event loops that track the currently-running
+// coroutine. It is an internal detail of eventLoopT; enter-sites use it to
+// maintain the current *contextT pointer with save/restore semantics so that
+// loop.Sleep / loop.CurrentScheduler work from any depth of the call stack
+// without threading coro.Context through every signature.
+type currentTracker interface {
+	// setCurrentCoroutine atomically stores ctx as the active coroutine and
+	// returns the previous value. Callers must restore the returned value when
+	// the coroutine yields again (save/restore pattern).
+	setCurrentCoroutine(ctx *contextT) *contextT
+}
+
 func MakeCoroutine(evtLoop EventLoop, f func(ctx Context)) func() {
 	return func() { RunCoroutine(evtLoop, f) }
 }
@@ -20,6 +32,15 @@ func RunCoroutine(evtLoop EventLoop, f func(ctx Context)) {
 	reg, _ := evtLoop.(coroutineRegistry)
 	if reg != nil {
 		reg.registerCoroutine(ctrl)
+	}
+
+	// Enter-site 1/5: first-run. Set current BEFORE starting the goroutine so
+	// that code running at the very beginning of f(ctx) already sees itself as
+	// the active coroutine. Restore after the first Yield.
+	tracker, _ := evtLoop.(currentTracker)
+	var prev *contextT
+	if tracker != nil {
+		prev = tracker.setCurrentCoroutine(ctx)
 	}
 
 	go func() {
@@ -39,4 +60,8 @@ func RunCoroutine(evtLoop EventLoop, f func(ctx Context)) {
 	}()
 
 	ctrl.WaitUntilYielded()
+
+	if tracker != nil {
+		tracker.setCurrentCoroutine(prev)
+	}
 }
