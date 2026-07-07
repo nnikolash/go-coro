@@ -107,7 +107,7 @@ func (e *eventLoopT) Sleep(d time.Duration) {
 func (e *eventLoopT) SleepUntil(t time.Time) {
 	cur := e.current.Load()
 	if cur == nil {
-		panic(panicSleepOutsideCoroutine)
+		panic(panicSleepUntilOutsideCoroutine)
 	}
 	cur.SleepUntil(t)
 }

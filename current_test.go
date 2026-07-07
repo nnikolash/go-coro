@@ -10,6 +10,66 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TestCurrentCoroutine_RestoreOnPark verifies the restore half of save/restore:
+// once a coroutine parks itself (calls loop.Sleep), loop.CurrentScheduler()
+// must return nil and loop.Sleep called from a bare AfterFunc callback (which
+// runs on the pump goroutine outside any coroutine) must panic.
+//
+// RED verification: neutralise the restore by removing setCurrentCoroutine(prev)
+// calls — current stays pointing at the parked coroutine, the nil-guard never
+// fires, and this test fails.
+func TestCurrentCoroutine_RestoreOnPark(t *testing.T) {
+	t.Parallel()
+
+	start := time.Unix(0, 0)
+	clock := chrono.NewSimulator(start)
+	loop := coro.NewEventLoop(clock)
+
+	var (
+		currentWhileParked      coro.Scheduler
+		sleepPanicWhileParked   interface{}
+		currentAfterComplete    coro.Scheduler
+		sleepPanicAfterComplete interface{}
+	)
+
+	// Coroutine parks for 2s.
+	loop.AddTask(func(ctx coro.Context) {
+		loop.Sleep(2 * time.Second)
+	})
+
+	// Bare AfterFunc at T+1s: coroutine is still parked. Observe current and
+	// attempt loop.Sleep — both must signal "no active coroutine".
+	clock.AfterFunc(1*time.Second, func(now time.Time) {
+		currentWhileParked = loop.CurrentScheduler()
+		func() {
+			defer func() { sleepPanicWhileParked = recover() }()
+			loop.Sleep(time.Second)
+		}()
+	})
+
+	// Bare AfterFunc at T+3s: coroutine has finished. Same assertions.
+	clock.AfterFunc(3*time.Second, func(now time.Time) {
+		currentAfterComplete = loop.CurrentScheduler()
+		func() {
+			defer func() { sleepPanicAfterComplete = recover() }()
+			loop.Sleep(time.Second)
+		}()
+	})
+
+	_, err := clock.ProcessAll(context.Background())
+	require.NoError(t, err)
+
+	require.Nil(t, currentWhileParked,
+		"current must be nil while coroutine is parked")
+	require.NotNil(t, sleepPanicWhileParked,
+		"loop.Sleep from bare callback (coroutine parked) must panic")
+
+	require.Nil(t, currentAfterComplete,
+		"current must be nil after coroutine completes")
+	require.NotNil(t, sleepPanicAfterComplete,
+		"loop.Sleep from bare callback (coroutine done) must panic")
+}
+
 // TestCurrentCoroutine_ABA_Resume verifies save/restore semantics: A sleeps, B
 // runs (current=B), B sleeps, A wakes — each coroutine observes itself as
 // loop.CurrentScheduler() before and after its own sleep.
