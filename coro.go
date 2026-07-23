@@ -34,6 +34,11 @@ func RunCoroutine(evtLoop EventLoop, f func(ctx Context)) {
 		reg.registerCoroutine(ctrl)
 	}
 
+	// Obtain the escape-handler provider once, before launching the goroutine,
+	// so the type assertion is not repeated on every escape (optimisation) and
+	// the goroutine closure captures a stable interface value.
+	escapeProv, _ := evtLoop.(escapeHandlerProvider)
+
 	// Enter-site 1/5: first-run. Set current BEFORE starting the goroutine so
 	// that code running at the very beginning of f(ctx) already sees itself as
 	// the active coroutine. Restore after the first Yield.
@@ -48,12 +53,35 @@ func RunCoroutine(evtLoop EventLoop, f func(ctx Context)) {
 			defer reg.unregisterCoroutine(ctrl)
 		}
 		defer ctrl.Done()
-		// Swallow the cancel sentinel (raised by ctrl.Cancel via Yield) so a
-		// torn-down coroutine exits cleanly; re-panic anything else.
+		// Recover wrapper — handles three cases:
+		//   1. nil recover (normal return): nothing to do.
+		//   2. errCoroutineCanceled sentinel: swallow so the goroutine exits cleanly.
+		//   3. escapeRequest sentinel: call the registered escape handler (after
+		//      the coroutine's own defers have fully unwound), then return.
+		//      The handler runs in this goroutine; it must be non-blocking because
+		//      the event loop is still parked in WaitUntilYielded — ctrl.Done()
+		//      only fires after this defer returns, unblocking the loop.
+		//   4. Anything else: re-panic so real bugs surface unchanged.
 		defer func() {
-			if r := recover(); r != nil && r != errCoroutineCanceled {
-				panic(r)
+			r := recover()
+			if r == nil {
+				return
 			}
+			if r == errCoroutineCanceled {
+				return
+			}
+			if esc, ok := r.(escapeRequest); ok {
+				var handler func(any)
+				if escapeProv != nil {
+					handler = escapeProv.getEscapeHandler()
+				}
+				if handler == nil {
+					panic(noEscapeHandlerPanic(esc.value))
+				}
+				handler(esc.value)
+				return
+			}
+			panic(r)
 		}()
 
 		f(ctx)

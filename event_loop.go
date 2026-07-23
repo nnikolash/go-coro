@@ -61,6 +61,9 @@ type eventLoopT struct {
 
 	liveMu sync.Mutex
 	live   map[*YieldController]struct{}
+
+	escapeHandlerMu sync.RWMutex
+	escapeHandler   func(any)
 }
 
 var _ EventLoop = &eventLoopT{}
@@ -121,6 +124,31 @@ func (e *eventLoopT) CurrentScheduler() Scheduler {
 		return nil
 	}
 	return cur
+}
+
+// SetEscapeHandler registers fn as the handler to call when a coroutine on
+// this loop calls coro.Escape. The handler is invoked from within the
+// coroutine's goroutine after its stack has been fully unwound (all defers
+// have run); it must therefore be non-blocking — in particular, it must not
+// synchronously wait for the event loop (which is still blocked in
+// WaitUntilYielded at that point). Calling a goroutine-launching helper like
+// requestReinit is safe.
+//
+// SetEscapeHandler may be called before any coroutine starts. Calling it a
+// second time replaces the previous handler. Passing nil removes the handler;
+// Escape without a handler re-panics (fail-loud).
+func (e *eventLoopT) SetEscapeHandler(fn func(any)) {
+	e.escapeHandlerMu.Lock()
+	defer e.escapeHandlerMu.Unlock()
+	e.escapeHandler = fn
+}
+
+// getEscapeHandler returns the currently registered escape handler, or nil.
+// Implements escapeHandlerProvider (used by RunCoroutine via type assertion).
+func (e *eventLoopT) getEscapeHandler() func(any) {
+	e.escapeHandlerMu.RLock()
+	defer e.escapeHandlerMu.RUnlock()
+	return e.escapeHandler
 }
 
 // Close tears down every coroutine that is still suspended on this loop and
