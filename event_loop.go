@@ -64,6 +64,16 @@ type eventLoopT struct {
 
 	escapeHandlerMu sync.RWMutex
 	escapeHandler   func(any)
+
+	// urgentTasks holds coroutines enqueued by AddUrgentTask. They are drained
+	// at the start of every AddDelayedTask/AddPlannedTask callback (before the
+	// regular task runs) and by the explicit drain-trigger that AddUrgentTask
+	// schedules as a fallback. This ensures urgent tasks execute before all
+	// tasks that were already in the clock queue at the time AddUrgentTask was
+	// called (under chrono.Simulator; under chrono.RealClock the ordering is
+	// best-effort due to goroutine scheduling non-determinism).
+	urgentMu    sync.Mutex
+	urgentTasks []func(ctx Context)
 }
 
 var _ EventLoop = &eventLoopT{}
@@ -180,20 +190,77 @@ func (e *eventLoopT) Close() int {
 	return torndown
 }
 
+// drainUrgent runs all pending urgent tasks in enqueue order and clears the
+// queue. It is called at the start of every regular-task clock callback so
+// that urgent tasks execute before the regular task that was already queued.
+// It is also called by the drain-trigger clock task that AddUrgentTask
+// schedules, so that urgent tasks run even when no other tasks are pending.
+//
+// drainUrgent takes a snapshot under the lock and releases it before running
+// any coroutine, so tasks added to urgentTasks while draining are not
+// included in the current drain pass (they will be picked up by the next
+// regular callback or drain-trigger).
+func (e *eventLoopT) drainUrgent() {
+	e.urgentMu.Lock()
+	tasks := e.urgentTasks
+	e.urgentTasks = nil
+	e.urgentMu.Unlock()
+
+	for _, t := range tasks {
+		RunCoroutine(e, t)
+	}
+}
+
+// AddUrgentTask enqueues fn to run before the next regular (AddTask /
+// AddDelayedTask / AddPlannedTask) task that this event loop processes.
+//
+// Under chrono.Simulator the urgent task is guaranteed to execute before all
+// tasks that were already in the clock queue at call time: every regular-task
+// clock callback drains urgentTasks first (before running the regular task).
+//
+// Under chrono.RealClock the ordering is best-effort — the urgent goroutine
+// starts as early as possible, but concurrent goroutines racing in the
+// runtime scheduler may interleave. The common use-case (calling from an
+// escape handler) provides a natural head-start because the escape handler
+// finishes before the event loop can start the next queued task.
+//
+// AddUrgentTask is safe to call from any goroutine, including from within a
+// coroutine or an escape handler. Multiple calls accumulate in FIFO order;
+// all accumulated tasks are drained as a batch before the next regular task.
+func (e *eventLoopT) AddUrgentTask(fn func(ctx Context)) {
+	e.urgentMu.Lock()
+	e.urgentTasks = append(e.urgentTasks, fn)
+	e.urgentMu.Unlock()
+
+	// Post a drain-trigger so that even if no regular task is pending the
+	// urgent task will eventually execute. If a regular task fires before this
+	// trigger, that task's callback drains urgentTasks first, making this
+	// trigger a no-op (drainUrgent finds nothing to run).
+	e.clock.AfterFunc(0, func(now time.Time) {
+		e.drainUrgent()
+	})
+}
+
 func (e *eventLoopT) AddTask(task func(ctx Context)) chrono.Timer {
 	return e.AddDelayedTask(0, task)
 }
 
 func (e *eventLoopT) AddDelayedTask(d time.Duration, task func(ctx Context)) chrono.Timer {
 	c := MakeCoroutine(e, task)
-	timer := e.clock.AfterFunc(d, func(now time.Time) { c() })
+	timer := e.clock.AfterFunc(d, func(now time.Time) {
+		e.drainUrgent()
+		c()
+	})
 
 	return timer
 }
 
 func (e *eventLoopT) AddPlannedTask(t time.Time, task func(ctx Context)) chrono.Timer {
 	c := MakeCoroutine(e, task)
-	timer := e.clock.UntilFunc(t, func(now time.Time) { c() })
+	timer := e.clock.UntilFunc(t, func(now time.Time) {
+		e.drainUrgent()
+		c()
+	})
 
 	return timer
 }
