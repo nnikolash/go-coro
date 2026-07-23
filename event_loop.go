@@ -25,6 +25,9 @@ type EventLoop interface {
 	AddDelayedTask(d time.Duration, task func(ctx Context)) chrono.Timer
 	AddPlannedTask(t time.Time, task func(ctx Context)) chrono.Timer
 	AddPlannedTaskCtx(ctx context.Context, t time.Time, task func(ctx Context))
+	// AddUrgentTask enqueues fn to run before the next regular task on this
+	// event loop. See eventLoopT.AddUrgentTask for full semantics.
+	AddUrgentTask(fn func(ctx Context))
 }
 
 var DefaultEventLoop = NewEventLoop(chrono.DefaultClock)
