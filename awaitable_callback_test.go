@@ -6,21 +6,28 @@ package coro_test
 //  1. resolve called BEFORE wait -> wait returns immediately; proven via the
 //     event loop's own task counter, not just via timing.
 //  2. resolve called AFTER wait starts, from a foreign (real, concurrent)
-//     goroutine -> waiter resumes, value arrives, loop keeps running.
-//  3. resolve called AFTER wait starts, from the loop itself (another
-//     already-running coroutine, mirroring Mutex) -> waiter resumes
-//     correctly, and — the "main subtlety" — with no extra clock hop.
-//  4. Coroutine cancelled while waiting -> clean unwind; resolve called
-//     afterwards must be harmless (must not resurrect a dead coroutine).
-//  5. resolve called twice -> panics; the second call must not corrupt the
+//     goroutine -> waiter resumes, value arrives, loop keeps running. Also
+//     covers resolve racing wait's own registration, and resolve called from
+//     another already-running coroutine on the same loop — both go through
+//     the same Resume() path as the foreign-goroutine case; there is no
+//     separate "in place" path (see the doc comment on AwaitableCallback).
+//  3. Coroutine cancelled while waiting -> clean unwind; resolve called
+//     afterwards must be harmless (must not resurrect a dead coroutine), and
+//     a fresh wait() call afterwards must not spuriously panic (the waiter
+//     registration must be cleared on teardown).
+//  4. resolve called twice -> panics; the second call must not corrupt the
 //     first result. wait called twice concurrently -> panics (single-waiter
 //     guard).
+//  5. Known, documented limitation: resolve racing loop.Close() can panic on
+//     Close's caller — not fixable from inside this primitive. See
+//     TestAwaitableCallback_ResolveRacesClose.
 //  6. Positive control: run the rest of the package's test suite (done by
 //     the "go test ./..." gate, not duplicated here).
 //
-// Race-detector coverage: TestAwaitableCallback_ResolvedFromForeignGoroutine
-// and TestAwaitableCallback_ResolveTwice_ConcurrentCallers below are written
-// to be meaningful under `go test -race`.
+// Race-detector coverage: TestAwaitableCallback_ResolvedFromForeignGoroutine,
+// TestAwaitableCallback_ResolveTwice_ConcurrentCallers, and
+// TestAwaitableCallback_ResolveRacesClose below are written to be meaningful
+// under `go test -race`.
 
 import (
 	"context"
@@ -152,10 +159,11 @@ func TestAwaitableCallback_ResolvedFromForeignGoroutine(t *testing.T) {
 
 // TestAwaitableCallback_ResolvedFromForeignGoroutine_RacesIntoRegistration
 // deliberately does NOT wait for the coroutine to reach Pause() before
-// resolving — it races the callback against wait()'s own registration, which
-// is exactly the narrow window the isPaused() check exists to protect
-// (see the doc comment on AwaitableCallback / YieldController.isPaused).
-// Run with -race and with -count to shake out timing-dependent bugs.
+// resolving — it races the callback against wait()'s own registration.
+// Because resolve always resumes through Resume() (a clock hop, never a
+// direct call into the parked coroutine), this is safe regardless of exactly
+// when, relative to Pause(), the race lands. Run with -race and with -count
+// to shake out timing-dependent bugs.
 func TestAwaitableCallback_ResolvedFromForeignGoroutine_RacesIntoRegistration(t *testing.T) {
 	// Not t.Parallel() — gives the race detector isolated CPU time.
 
@@ -184,25 +192,21 @@ func TestAwaitableCallback_ResolvedFromForeignGoroutine_RacesIntoRegistration(t 
 }
 
 // ---------------------------------------------------------------------------
-// (3) resolve from the loop itself (another already-running coroutine)
+// (2b) resolve from another already-running coroutine on the same loop
 // ---------------------------------------------------------------------------
 
-// TestAwaitableCallback_ResolvedFromLoopItself mirrors coro.Mutex's own
-// waiter-resumption pattern: coroutine B calls resolve directly (not via a
-// separate goroutine) while it is the one actively running on the loop.
-//
-// This proves both correctness AND the "main subtlety" from the brief: since
-// B is cooperatively running, A (the waiter) must already be paused, so
-// resolve must take the in-place path (YieldController.isPaused == true) —
-// no clock hop. Proven the same way as test (1): via the simulator's own
-// task counter. Two tasks are queued (A and B); if resolve added a third
-// (scheduled) task to resume A, the total would be 3 instead of 2.
-//
-// RED verification: replace the isPaused()-guarded direct call in resolve
-// with an unconditional waiter.Resume() and this test's task-count assertion
-// fails (3 instead of 2) even though the value still arrives correctly —
-// demonstrating why "it works" is not the same as "resolves in place".
-func TestAwaitableCallback_ResolvedFromLoopItself(t *testing.T) {
+// TestAwaitableCallback_ResolvedFromAnotherCoroutine covers the third way
+// resolve can be invoked: from another coroutine that is cooperatively
+// running on the very same loop as the waiter (as opposed to a genuinely
+// foreign goroutine). It goes through exactly the same Resume() path as the
+// foreign-goroutine case — there is no separate "resolve in place" shortcut
+// (see the doc comment on AwaitableCallback for why an earlier revision had
+// one, and why it was removed). Consequently B's resolve() call schedules a
+// task and returns immediately; A only resumes once the loop gets to that
+// scheduled task, i.e. *after* B's own coroutine body has finished — proven
+// here by both the execution order and the task count (3: A's task, B's
+// task, and the scheduled resume).
+func TestAwaitableCallback_ResolvedFromAnotherCoroutine(t *testing.T) {
 	t.Parallel()
 
 	clock := chrono.NewSimulator(time.Unix(0, 0))
@@ -225,24 +229,23 @@ func TestAwaitableCallback_ResolvedFromLoopItself(t *testing.T) {
 	// instant), and resolves directly from its own coroutine body.
 	loop.AddTask(func(ctx coro.Context) {
 		order = append(order, "B-run")
-		resolve("from-the-loop-itself", nil)
+		resolve("from-another-coroutine", nil)
 		order = append(order, "B-done")
 	})
 
 	n, err := clock.ProcessAll(context.Background())
 	require.NoError(t, err)
 
-	require.Equal(t, "from-the-loop-itself", got)
+	require.Equal(t, "from-another-coroutine", got)
 	require.NoError(t, gotErr)
-	// B calling resolve() resumes A synchronously, in place, before B
-	// continues — "B-done" comes after "A-resumed".
-	require.Equal(t, []string{"A-start", "B-run", "A-resumed", "B-done"}, order)
-	require.Equal(t, 2, n,
-		"resolve() called from the loop itself must resume the waiter in place, with no extra scheduled task")
+	// resolve() always defers through the clock, so B finishes its own body
+	// ("B-done") before A gets resumed ("A-resumed").
+	require.Equal(t, []string{"A-start", "B-run", "B-done", "A-resumed"}, order)
+	require.Equal(t, 3, n, "resolve() schedules exactly one extra task to resume the waiter")
 }
 
 // ---------------------------------------------------------------------------
-// (4) cancellation while waiting
+// (3) cancellation while waiting
 // ---------------------------------------------------------------------------
 
 // TestAwaitableCallback_CancelWhileWaiting verifies clean unwind when the
@@ -280,19 +283,96 @@ func TestAwaitableCallback_CancelWhileWaiting(t *testing.T) {
 	}
 	require.False(t, resumed, "code after wait() must not run on a cancelled coroutine")
 
-	// Harmless-after-cancel: resolving now must not panic, and any task it
-	// schedules (the Resume() fallback path, since the cancelled waiter's
-	// YieldController is no longer paused) must be a safe no-op once run.
+	// Harmless-after-cancel: resolving now must not panic. wait()'s own
+	// cleanup defer already cleared the waiter registration during the
+	// Close() above, so resolve() here sees nobody is waiting and does not
+	// even schedule anything (see TestAwaitableCallback_WaitAgainAfterCancel
+	// for the direct proof that the registration was cleared).
 	require.NotPanics(t, func() {
 		resolve(99, nil)
 	})
 
 	_, err = clock.ProcessAll(context.Background())
-	require.NoError(t, err, "draining the fallback resume task after cancellation must not error or hang")
+	require.NoError(t, err, "there must be nothing left to drain after cancellation")
+}
+
+// TestAwaitableCallback_WaitAgainAfterCancel is the direct regression test
+// for the bug independent review found: wait()'s registration used to leak
+// when the waiting coroutine was torn down — a *fresh* wait() call on the
+// same AwaitableCallback instance afterwards would spuriously panic with
+// "supports exactly one waiter", even though nobody was actually waiting
+// anymore. wait()'s cleanup defer now clears the registration unconditionally
+// on the way out (including during cancellation unwind), so a later wait()
+// call must succeed normally instead.
+//
+// The second wait() call is run to completion (a full clock.ProcessAll pass,
+// not just enqueued) *before* resolve() fires again, so it genuinely reaches
+// wait's "a.waiter != nil" check while a.done is still false — enqueuing
+// alone would not exercise that check, since AddTask does not run the
+// coroutine synchronously.
+//
+// RED verification: remove the `defer` block in wait() that clears a.waiter
+// and the second wait() call panics with "supports exactly one waiter" —
+// inside the freshly spawned coroutine's own goroutine, which RunCoroutine's
+// recover re-panics (it is not the cancellation sentinel), crashing the
+// whole test binary rather than failing cleanly. That is itself informative:
+// it is why this primitive treats "waiter registration leaked" as a bug
+// worth a dedicated regression test rather than trusting it to surface as an
+// ordinary assertion failure.
+func TestAwaitableCallback_WaitAgainAfterCancel(t *testing.T) {
+	t.Parallel()
+
+	clock := chrono.NewSimulator(time.Unix(0, 0))
+	loop := coro.NewEventLoop(clock)
+
+	resolve, wait := coro.AwaitableCallback[int]()
+
+	firstCleaned := make(chan struct{})
+	loop.AddTask(func(ctx coro.Context) {
+		defer close(firstCleaned)
+		_, _ = wait(ctx) // never resolved; torn down by loop.Close() below
+	})
+
+	n, err := clock.ProcessAll(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 1, n)
+
+	require.Equal(t, 1, loop.Close(), "the first (parked) waiter must be torn down")
+	select {
+	case <-firstCleaned:
+	case <-time.After(time.Second):
+		t.Fatal("first waiter's deferred cleanup did not run")
+	}
+
+	// A second, fresh coroutine calls wait() on the SAME AwaitableCallback
+	// instance, before resolve() fires again — a.done is still false, so this
+	// genuinely exercises the "a.waiter != nil" check.
+	secondDone := make(chan struct{})
+	var got int
+	loop.AddTask(func(ctx coro.Context) {
+		got, _ = wait(ctx)
+		close(secondDone)
+	})
+
+	n, err = clock.ProcessAll(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 1, n, "second wait() must register and park normally, not panic")
+
+	resolve(7, nil)
+
+	_, err = clock.ProcessAll(context.Background())
+	require.NoError(t, err)
+
+	select {
+	case <-secondDone:
+	case <-time.After(time.Second):
+		t.Fatal("second wait() call never resumed")
+	}
+	require.Equal(t, 7, got)
 }
 
 // ---------------------------------------------------------------------------
-// (5) one-shot / single-waiter misuse panics
+// (4) one-shot / single-waiter misuse panics
 // ---------------------------------------------------------------------------
 
 // TestAwaitableCallback_ResolveTwice_Panics documents and verifies the chosen
@@ -393,11 +473,102 @@ func TestAwaitableCallback_WaitTwice_Panics(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// (5) known, documented limitation: resolve racing loop.Close()
+// ---------------------------------------------------------------------------
+
+// TestAwaitableCallback_ResolveRacesClose demonstrates and characterizes a
+// real race between resolve() and loop.Close() that AwaitableCallback cannot
+// close on its own — see the "Known limitation" section of the doc comment
+// on AwaitableCallback for the full account.
+//
+// In short: resolve's call to the waiter's Resume() un-pauses it
+// asynchronously, through the clock. If loop.Close() concurrently calls
+// Cancel() on that same waiter while it is in the brief window between
+// "un-paused" and "paused or finished again", Cancel's own precondition
+// check can fail and panic — on Close's caller's goroutine, with the message
+// "coro: Cancel called on a coroutine that is not suspended". This is not
+// unique to AwaitableCallback: the identical panic reproduces with plain
+// ctx.Pause() and no AwaitableCallback involved at all, racing loop.Close()
+// against a coroutine's own natural startup under chrono.RealClock — Close
+// assumes nothing else can transition a registered coroutine's pause state
+// concurrently, which chrono.RealClock does not guarantee. A real fix would
+// have to live in YieldController.Cancel / eventLoopT.Close, which is out of
+// scope for this primitive (see the boundary on not changing existing loop
+// behavior); this test exists to document and bound the exposure, not to
+// pretend it is fixed.
+//
+// The interleaving needed to hit the panic (loop.Close() must land inside a
+// window that is normally microseconds wide, right after the waiter's
+// asynchronous resume fires and before it re-pauses or finishes) is rare
+// under pure goroutine-scheduler racing — under 1 hit per 300 tries measured
+// during development. To keep this test meaningful rather than a coin flip
+// that is 99%+ likely to report "0 hits" and prove nothing, the waiting
+// coroutine deliberately widens its own post-resume window with a short
+// real-time sleep, and loop.Close() is invoked a short, deliberate delay
+// after resolve() (sequenced, not raced blindly) — giving resolve()'s
+// AfterFunc(0) time to actually fire. This does not change *what* races —
+// resolve's resume still goes through the same asynchronous Resume() call a
+// production caller would use — it only makes the reproduction reliable
+// instead of leaving it to chance. Measured at 300/300 during development;
+// this test tolerates *exactly* the one documented panic message (counting
+// it, not failing on it) and fails on anything else — a different panic
+// message, a hang, or (run under -race) any data race — so it stays useful
+// as a regression guard for "did something get WORSE" without being flaky
+// about a limitation that is already known, explained, and out of this
+// primitive's reach.
+func TestAwaitableCallback_ResolveRacesClose(t *testing.T) {
+	// Not t.Parallel() — gives the race detector isolated CPU time, and this
+	// iterates internally.
+
+	const knownRacePanic = "coro: Cancel called on a coroutine that is not suspended"
+	const iterations = 300
+	knownRaceHits := 0
+
+	for i := 0; i < iterations; i++ {
+		loop := coro.NewEventLoop(chrono.NewRealClock())
+		resolve, wait := coro.AwaitableCallback[int]()
+
+		waiting := make(chan struct{})
+		loop.AddTask(func(ctx coro.Context) {
+			close(waiting)
+			_, _ = wait(ctx)
+			// Widen the "resumed but not yet re-paused/finished" window —
+			// this is what loop.Close() needs to land inside of to panic.
+			time.Sleep(3 * time.Millisecond)
+		})
+		<-waiting
+		time.Sleep(time.Millisecond) // let the coroutine's own startup settle
+
+		resolve(i, nil)                    // schedules the resume via Resume()
+		time.Sleep(500 * time.Microsecond) // give that AfterFunc(0) time to fire
+
+		func() {
+			defer func() {
+				r := recover()
+				if r == nil {
+					return
+				}
+				if msg, ok := r.(string); ok && msg == knownRacePanic {
+					knownRaceHits++
+					return
+				}
+				t.Errorf("iteration %d: loop.Close() panicked with an unexpected value: %v", i, r)
+			}()
+			loop.Close()
+		}()
+	}
+
+	t.Logf("known resolve-vs-Close race reproduced in %d/%d iterations", knownRaceHits, iterations)
+	require.Greater(t, knownRaceHits, 0,
+		"this test is supposed to reliably reproduce the known race; 0 hits means the reproduction itself broke (check timing), not that the race went away")
+}
+
+// ---------------------------------------------------------------------------
 // (6) positive control
 // ---------------------------------------------------------------------------
 //
 // Neighboring primitives (Mutex, plain loop tasks) are exercised by the rest
 // of this package's test suite (mutex_test.go, current_test.go,
 // urgent_test.go, teardown_test.go, ...) — running `go test ./...` alongside
-// this file is the positive control that AwaitableCallback's additions
-// (YieldController.isPaused in yield.go) did not disturb them.
+// this file is the positive control that AwaitableCallback did not disturb
+// them.

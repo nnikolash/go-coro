@@ -16,92 +16,43 @@ import "sync"
 // all (an exchange SDK's own read loop, say) — that is the whole reason this
 // primitive exists instead of a plain closure-captured variable.
 //
-// Two semantics are load-bearing, and the second is where this differs from
-// coro.Mutex (its nearest sibling in this package): Mutex assumes a
-// single-threaded loop and is never touched from a foreign goroutine, so it
-// can always resume waiters via ctx.Resume() (a clock hop). AwaitableCallback
-// cannot make that assumption.
+// # The one semantic that matters
 //
-//  1. If resolve has already run by the time wait is called, wait returns
-//     immediately: the calling coroutine does not yield, and nothing is
-//     scheduled on the event loop. This is the case that matters most — see
-//     the "AlreadyResolved" test for why. In a deterministic simulation the
-//     producer's answer is often already known; inserting a scheduling hop
-//     here would make two runs of the same simulation free to interleave
-//     that hop differently against other zero-delay events, and replays
-//     would diverge. A "resolve always defers, like a JS `then`" design does
-//     not satisfy this.
-//  2. If resolve runs after wait has started waiting, the waiting coroutine
-//     is resumed through the same machinery Context.Resume uses
-//     (contextT.runUntilYielded, including its current-tracker save/restore)
-//     — never a raw call into the coroutine's own code. What varies is *how*
-//     that resumption is triggered — see "Resolving in place" below.
+// If resolve has already run by the time wait is called, wait returns
+// immediately: the calling coroutine does not yield, and nothing is
+// scheduled on the event loop (see wait's a.done fast path below). This is
+// the case the whole primitive exists for. The canonical caller looks like:
 //
-// # Resolving in place
+//	resolve, wait := coro.AwaitableCallback[Sub]()
+//	client.SubscribeOnOrderBook(sym, depth, handler, resolve) // simulator calls resolve HERE
+//	sub, err := wait(ctx)                                     // done already true -> instant return
 //
-// The naive direct call — "if the waiter's YieldController is already
-// paused, just call runUntilYielded right here" — is NOT safe on its own,
-// even though the paused check is read under YieldController's own lock.
-// Here is the race a stress test (ResolvedFromForeignGoroutine_
-// RacesIntoRegistration) actually reproduced with that version:
+// A simulated exchange client typically calls its "subscribed" callback
+// synchronously, inside the call that registers the subscription — i.e.
+// strictly *before* wait is ever called. In a deterministic simulation that
+// answer is already known; inserting a scheduling hop here would make two
+// runs of the same simulation free to interleave that hop differently
+// against other zero-delay events, and replays would diverge. Proven by
+// TestAwaitableCallback_AlreadyResolved_NoYield via the event loop's own
+// task counter (not timing): an "always defer, like a JS `then`" design
+// would show up as an extra scheduled task, and does when neutralized.
 //
-// RunCoroutine (coro.go) starts a coroutine by launching its goroutine and
-// then calling ctrl.WaitUntilYielded() — and on chrono.RealClock that whole
-// call happens *inside* RealClock.executeTask's handlersLock (go-chrono
-// clock.go), which is what serializes it against every other clock callback
-// on that loop, including a later ctx.Resume()'s AfterFunc(0). A *direct*
-// call to runUntilYielded from an unsynchronized foreign goroutine is not
-// inside that lock. So: the waiter sets paused=true and parks in Yield's
-// Wait(); a foreign resolve() sees isPaused() == true and calls
-// runUntilYielded directly, which flips paused back to false, broadcasts,
-// and starts its *own* Wait(); that broadcast can wake the coroutine's
-// still-pending initial WaitUntilYielded() first — at which point paused is
-// false again (the foreign call just cleared it) and finished is still
-// false, and WaitUntilYielded panics ("yielding thread expected to be
-// paused or finished"). isPaused() answered correctly at the instant it was
-// read; the problem is that *acting* on it via a direct call raced a
-// synchronization point (the initial enter-site) that only clock.AfterFunc
-// is serialized against.
-//
-// The fix is to gate the direct call on the currentTracker instead of (in
-// addition to) isPaused: resolve calls runUntilYielded in place only when
-// currentCoroutine() reports some coroutine *other than the waiter itself*
-// is presently active on the loop. That is sufficient, not just a heuristic:
-// under both chrono.Simulator (single active execution) and chrono.RealClock
-// (executeTask's handlersLock), a *different* coroutine can only become
-// "current" after the waiter's own initial WaitUntilYielded() has already
-// returned — the same mutex/single-thread invariant that makes the loop
-// cooperative in the first place. So "some other coroutine is current" both
-// implies the waiter has already reached a stable paused-or-finished state
-// AND implies we are not a foreign, unsynchronized goroutine — which is
-// exactly Mutex's own precondition for calling a waiter directly, just
-// checked explicitly instead of assumed. Comparing against the waiter
-// itself (not just against nil) matters separately: RunCoroutine marks a
-// coroutine "current" *before* spawning its goroutine, so during the narrow
-// window between wait() registering itself and actually reaching Pause, a
-// foreign goroutine racing in at that exact instant would see "current ==
-// the waiter" — which must NOT be treated as "some other coroutine is
-// cooperatively running right now".
-//
-//   - currentCoroutine() reports some coroutine other than the waiter is
-//     current: resolve calls runUntilYielded directly, in place — no clock
-//     hop. Always true when resolve runs cooperatively from the loop itself
-//     (e.g. from another already-running coroutine, mirroring Mutex.Unlock
-//     calling a waiter's Resume).
-//   - Otherwise (no currentTracker, current is nil, or current is the
-//     waiter itself — including the foreign-goroutine race above): resolve
-//     falls back to the waiter's Resume(), which schedules through the
-//     clock. chrono's AfterFunc/UntilFunc/EveryFunc are documented as
-//     mutex-guarded and safe to call from any goroutine (see
-//     chrono.Simulator's doc comment), which is exactly what a
-//     foreign-goroutine callback needs, and — per the paragraph above — is
-//     also what correctly serializes it against the waiter's own enter-site.
-//
-// isPaused (yield.go) is still checked, in addition to the currentTracker
-// check, as a second, independent guard before taking the in-place path
-// (belt and suspenders: cheap, and it is what makes the "no lost wakeup"
-// argument in the doc for isPaused explicit at the call site). It is not,
-// on its own, sufficient — that is the bug this comment documents.
+// If resolve instead runs *after* wait has started waiting (the callback
+// arrives later — a real subscription confirmation, a real order fill), the
+// waiting coroutine is resumed via the waiter's own Resume(), i.e. through
+// the event loop's clock — never a direct call into the parked coroutine's
+// code. That is a deliberate simplification: an earlier revision of this
+// primitive tried to resume the waiter in place (no clock hop) whenever it
+// could "prove" doing so was safe, gated on the currentTracker. Independent
+// review found a real counterexample: a foreign goroutine racing in while
+// the loop happens to be running some unrelated coroutine reads "some other
+// coroutine is current" and (wrongly) concludes "safe", then runs the
+// waiter's body on the SDK's own goroutine concurrently with the loop — and
+// the fix is not a better predicate, it is removing the shortcut: the
+// determinism this primitive exists for comes entirely from wait's fast
+// path (above), not from resolving a *parked* waiter without a clock hop.
+// Always going through Resume() is simpler and closes that whole class of
+// bug at once.
 //
 // # One-shot, single waiter
 //
@@ -110,9 +61,39 @@ import "sync"
 // producer bug (e.g. both a success and an error path firing), and silently
 // ignoring it would hide that bug behind a "first answer wins" behavior
 // nobody asked for. wait panics if called while a previous call has not yet
-// returned — this primitive supports exactly one waiter; if a second
-// consumer is ever needed, it should be added deliberately (fan-out,
+// returned — this primitive supports exactly one waiter at a time; if a
+// second consumer is ever needed, it should be added deliberately (fan-out,
 // multiple resolutions) rather than discovered as a silently-dropped waiter.
+//
+// wait clears its own registration on the way out — including when Pause
+// panics with the coroutine-cancellation sentinel during teardown — so a
+// waiter that was cancelled while parked does not leave the primitive
+// permanently unusable: a resolve() that arrives afterwards sees nobody is
+// waiting (a harmless no-op) instead of trying to resume a dead coroutine,
+// and a fresh wait() call does not spuriously panic with "supports exactly
+// one waiter" when in fact nobody is waiting anymore. See
+// TestAwaitableCallback_WaitAgainAfterCancel.
+//
+// # Known limitation: resolve racing loop.Close()
+//
+// There is a real race between resolve() and loop.Close() that this
+// primitive does NOT close, and cannot close without changing Cancel/Close
+// themselves (out of scope for this primitive — see
+// TestAwaitableCallback_ResolveRacesClose for the full account and a
+// reproduction). In short: resolve's call to the waiter's Resume() un-pauses
+// it asynchronously, through the clock; if loop.Close() concurrently calls
+// Cancel() on that same waiter while it is in the brief window between
+// "un-paused" and "paused or finished again", Cancel()'s own precondition
+// check ("must be called while paused") can fail and panic — on Close's
+// caller's goroutine, not on resolve's. This is not unique to
+// AwaitableCallback: the same panic reproduces with plain ctx.Pause() and no
+// AwaitableCallback involved at all, racing loop.Close() against a
+// coroutine's own natural startup under chrono.RealClock — Close simply
+// assumes nothing else can transition a registered coroutine's pause state
+// concurrently, which chrono.RealClock does not guarantee. Until that is
+// addressed at the Close/Cancel level, callers must not call loop.Close()
+// while a producer might still call resolve() for a waiter registered on
+// that loop.
 func AwaitableCallback[T any]() (resolve func(v T, err error), wait func(ctx Context) (T, error)) {
 	a := &awaitableCallback[T]{}
 	return a.resolve, a.wait
@@ -139,38 +120,18 @@ func (a *awaitableCallback[T]) resolve(v T, err error) {
 	a.mu.Unlock()
 
 	if waiter == nil {
-		// Nobody is waiting yet. wait() will see a.done == true and return
-		// immediately, without ever calling Pause — satisfies semantic 1.
+		// Nobody is waiting yet (or the waiter was already torn down and
+		// cleared its registration — see wait's defer). wait() will see
+		// a.done == true and return immediately, without ever calling
+		// Pause — satisfies the one semantic that matters, above.
 		return
 	}
 
-	if a.resolvingInPlaceIsSafe(waiter) {
-		// See the "Resolving in place" doc comment above for why both of
-		// these conditions together (not either alone) make this safe.
-		waiter.runUntilYielded()
-		return
-	}
-
-	// Not provably safe to call directly: marshal through the clock instead
-	// — exactly what Context.Resume does, and (per the doc comment above)
-	// what correctly serializes against the waiter's own enter-site.
+	// The waiter is parked. Resume it through the clock, exactly like any
+	// other cross-goroutine resume in this library — see the doc comment's
+	// "one semantic that matters" section for why there is no in-place
+	// shortcut here.
 	waiter.Resume()
-}
-
-// resolvingInPlaceIsSafe reports whether resolve may call waiter.
-// runUntilYielded directly instead of going through waiter.Resume(). See the
-// "Resolving in place" section of AwaitableCallback's doc comment.
-func (a *awaitableCallback[T]) resolvingInPlaceIsSafe(waiter *contextT) bool {
-	if waiter.tracker == nil {
-		return false // no way to tell; always safe to fall back to Resume().
-	}
-
-	cur := waiter.tracker.currentCoroutine()
-	if cur == nil || cur == waiter {
-		return false
-	}
-
-	return waiter.ctrl.isPaused()
 }
 
 func (a *awaitableCallback[T]) wait(ctx Context) (T, error) {
@@ -191,6 +152,17 @@ func (a *awaitableCallback[T]) wait(ctx Context) (T, error) {
 	}
 	a.waiter = c
 	a.mu.Unlock()
+
+	defer func() {
+		// Clear the registration unconditionally on the way out — including
+		// when Pause panics with the cancellation sentinel below, during
+		// teardown — so a resolve() that arrives afterwards (or a fresh
+		// wait() call) does not find a stale, dead waiter. See the "One-shot,
+		// single waiter" section of the doc comment above.
+		a.mu.Lock()
+		a.waiter = nil
+		a.mu.Unlock()
+	}()
 
 	c.Pause()
 
