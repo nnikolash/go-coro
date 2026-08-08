@@ -106,6 +106,12 @@ func (e *eventLoopT) setCurrentCoroutine(ctx *contextT) *contextT {
 	return e.current.Swap(ctx)
 }
 
+// currentCoroutine returns the coroutine currently marked active on this
+// loop, or nil. Part of the currentTracker interface; see its doc comment.
+func (e *eventLoopT) currentCoroutine() *contextT {
+	return e.current.Load()
+}
+
 // Sleep suspends the currently-running coroutine for duration d, delegating to
 // the coroutine's own Clock.Sleep. Panics if called outside a coroutine.
 // Under chrono.Simulator this is deterministic; under RealClock the behaviour
