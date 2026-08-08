@@ -166,22 +166,3 @@ func (t *YieldController) Done() {
 	t.finished = true
 	t.stateToggledEvt.Broadcast()
 }
-
-// isPaused reports whether the coroutine is currently suspended (Yield has
-// been called and it has not since been resumed, cancelled, or finished).
-// Safe to call from any goroutine — guarded by the same lock as
-// Yield/Cancel/Continue/RunUntilYielded/Done, so it never observes a
-// half-updated state.
-//
-// Used by AwaitableCallback (awaitable_callback.go) to decide whether a
-// pending resolve can resume the waiter directly, in place: RunUntilYielded's
-// "un-pause, then wait for the next pause/finish" logic is only correct to
-// invoke when the coroutine has already reached Yield's Wait() — calling it
-// one instant earlier would consume the coroutine's *first* pause broadcast
-// as if it were a resume, permanently losing the wakeup.
-func (t *YieldController) isPaused() bool {
-	t.stateToggledEvt.L.Lock()
-	defer t.stateToggledEvt.L.Unlock()
-
-	return t.paused
-}

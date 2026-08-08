@@ -19,17 +19,6 @@ type currentTracker interface {
 	// returns the previous value. Callers must restore the returned value when
 	// the coroutine yields again (save/restore pattern).
 	setCurrentCoroutine(ctx *contextT) *contextT
-
-	// currentCoroutine returns the coroutine currently marked active on this
-	// loop, or nil if the pump is between coroutines. Read-only counterpart to
-	// setCurrentCoroutine, added for AwaitableCallback (awaitable_callback.go):
-	// it lets a resolve call decide whether it is running cooperatively,
-	// nested inside some *other* already-running coroutine on the same loop
-	// (safe to resume a waiter in place), as opposed to running on a foreign
-	// goroutine (only safe to resume through the clock — see the doc comment
-	// on AwaitableCallback for why "some other coroutine is current" is the
-	// right test, and why comparing against the *waiter itself* matters).
-	currentCoroutine() *contextT
 }
 
 func MakeCoroutine(evtLoop EventLoop, f func(ctx Context)) func() {
